@@ -1,0 +1,66 @@
+import express from "express";
+import fetch from "node-fetch";
+
+const app = express();
+app.use(express.json());
+
+const VERIFY_TOKEN  = process.env.VERIFY_TOKEN;
+const PAGE_TOKEN    = process.env.PAGE_TOKEN;
+const TYPEBOT_TOKEN = process.env.TYPEBOT_TOKEN;
+const PORT          = process.env.PORT || 3000;
+
+const sessions = new Map();
+const getSession = psid => (sessions.has(psid) ? sessions.get(psid) : (sessions.set(psid, psid), psid));
+
+async function sendToMessenger(psid, text) {
+ const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${PAGE_TOKEN}`;
+ const body = { recipient: { id: psid }, messaging_type: "RESPONSE", message: { text: text || "…" } };
+ const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+ if (!res.ok) console.error("FB send error:", await res.text());
+}
+
+function extractReply(tb) {
+ const m = tb?.data?.messages?.[0];
+ if (!m) return null;
+ if (m?.content?.markdown) return m.content.markdown;
+ const items = m?.input?.items;
+ if (items?.length) {
+   const prompt = m?.input?.prompt || "Choose an option:";
+   const lines = items.map(it => it?.title || it?.label || it?.value || "").filter(Boolean);
+   if (lines.length) return prompt + "\n" + lines.join("\n");
+ }
+ return m?.content?.plainText || "…";
+}
+
+app.get("/webhook", (req, res) => {
+ const mode = req.query["hub.mode"];
+ const token = req.query["hub.verify_token"];
+ const challenge = req.query["hub.challenge"];
+ if (mode === "subscribe" && token === VERIFY_TOKEN) return res.status(200).send(challenge);
+ return res.sendStatus(403);
+});
+
+app.post("/webhook", async (req, res) => {
+ try {
+   const msg = req.body?.entry?.[0]?.messaging?.[0];
+   const psid = msg?.sender?.id;
+   const text = msg?.message?.text || msg?.postback?.payload || "👋";
+   if (!psid) return res.sendStatus(200);
+
+   const sessionId = getSession(psid);
+   const tbRes = await fetch(`https://typebot.io/api/v1/sessions/${encodeURIComponent(sessionId)}/continueChat`, {
+     method: "POST",
+     headers: { "Authorization": `Bearer ${TYPEBOT_TOKEN}`, "Content-Type": "application/json" },
+     body: JSON.stringify({ message: text, textBubbleContentFormat: "markdown" })
+   }).then(r => r.json()).catch(e => ({ error: String(e) }));
+
+   await sendToMessenger(psid, extractReply(tbRes) || "…");
+   res.sendStatus(200);
+ } catch (e) {
+   console.error("Webhook error:", e);
+   res.sendStatus(200);
+ }
+});
+
+app.get("/", (_req, res) => res.send("Typebot ↔ Messenger relay is running."));
+app.listen(PORT, () => console.log(`Relay listening on :${PORT}`));
